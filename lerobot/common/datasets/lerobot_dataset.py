@@ -48,6 +48,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         split: str = "train",
         transform: Callable | None = None,
         delta_timestamps: dict[list[float]] | None = None,
+        video_backend: str | None = None,
     ):
         super().__init__()
         self.repo_id = repo_id
@@ -69,6 +70,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.info = load_info(repo_id, version, root)
         if self.video:
             self.videos_dir = load_videos(repo_id, version, root)
+            self.video_backend = video_backend if video_backend is not None else "pyav"
 
     @property
     def fps(self) -> int:
@@ -149,6 +151,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 self.video_frame_keys,
                 self.videos_dir,
                 self.tolerance_s,
+                self.video_backend,
             )
 
         if self.transform is not None:
@@ -227,6 +230,7 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         split: str = "train",
         transform: Callable | None = None,
         delta_timestamps: dict[list[float]] | None = None,
+        video_backend: str | None = None,
     ):
         super().__init__()
         self.repo_ids = repo_ids
@@ -240,6 +244,7 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
                 split=split,
                 delta_timestamps=delta_timestamps,
                 transform=transform,
+                video_backend=video_backend,
             )
             for repo_id in repo_ids
         ]
