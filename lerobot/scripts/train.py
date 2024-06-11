@@ -268,6 +268,11 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
             f"The configured output directory {Logger.get_last_checkpoint_dir(out_dir)} already exists."
         )
 
+    if cfg.training.save_freq > cfg.training.offline_steps:
+        print(
+            "WARNING : The save_freq is higher than offline_steps. The model will not be saved during training."
+        )
+
     # log metrics to terminal and wandb
     logger = Logger(cfg, out_dir, wandb_job_name=job_name)
 
