@@ -44,14 +44,17 @@ https://huggingface.co/lerobot/diffusion_pusht/tree/main.
 import argparse
 import json
 import logging
+import math
 import threading
 import time
+from collections import deque
 from contextlib import nullcontext
 from copy import deepcopy
 from datetime import datetime as dt
 from pathlib import Path
 from typing import Callable
 
+import cv2
 import einops
 import gymnasium as gym
 import numpy as np
@@ -82,6 +85,7 @@ def rollout(
     seeds: list[int] | None = None,
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
+    do_simulate_latency: bool = False,
     enable_progbar: bool = False,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
@@ -112,6 +116,8 @@ def rollout(
             are returned optionally because they typically take more memory to cache. Defaults to False.
         render_callback: Optional rendering callback to be used after the environments are reset, and after
             every step.
+        do_simulate_latency: Whether to simulate latency between observation and action execution. See inline
+            documentation for more details.
         enable_progbar: Enable a progress bar over rollout steps.
     Returns:
         The dictionary described above.
@@ -122,7 +128,7 @@ def rollout(
     # Reset the policy and environments.
     policy.reset()
 
-    observation, info = env.reset(seed=seeds)
+    gym_observation, info = env.reset(seed=seeds)
     if render_callback is not None:
         render_callback(env)
 
@@ -132,7 +138,6 @@ def rollout(
     all_successes = []
     all_dones = []
 
-    step = 0
     # Keep track of which environments are done.
     done = np.array([False] * env.num_envs)
     max_steps = env.call("_max_episode_steps")[0]
@@ -142,25 +147,122 @@ def rollout(
         disable=not enable_progbar,
         leave=False,
     )
+    first_step_done_for_latency_logic = False
+    # If we are simulating latency, store a queue of actions along with their supposed eta (relative to now).
+    # For example, if we do inference to get an action and it takes 200 ms to run, we store 0.2. Every loop
+    # iteration we decrement this by 1 / fps.
+    action_queue: deque[tuple[np.ndarray, float]] = deque()
+    # If we are simulating latency, we will keep track of the number of clock cycles that we missed because
+    # the policy was not done with inference on time.
+    n_dropped_cycles = 0
     while not np.all(done):
-        # Numpy array to tensor and changing dictionary keys to LeRobot policy format.
-        observation = preprocess_observation(observation)
-        if return_observations:
-            all_observations.append(deepcopy(observation))
+        is_dropped_cycle = False  # whether the action was dropped for this step because of latency
 
-        observation = {key: observation[key].to(device, non_blocking=True) for key in observation}
+        start_policy_time = time.perf_counter()
 
-        with torch.inference_mode():
-            action = policy.select_action(observation)
+        # If we are simulating latency, we need to decide if we are even allowed to query the policy.
+        # We are assuming that the policy can't process the current observation if it is still working
+        # on a previous one.
+        if do_simulate_latency and (pending_count := sum(item[-1] > 0 for item in action_queue)) > 0:
+            # At least 1 of the items in the queue is (supposedly) still waiting to be processed!
+            n_dropped_cycles += 1
+            is_dropped_cycle = True
+            # In fact, we should hope that ONLY 1 item has a positive value (otherwise it means we
+            # have supposedly allowed the policy to run concurrently for different steps).
+            assert pending_count == 1
+        else:
+            # Numpy array to tensor and changing dictionary keys to LeRobot policy format.
+            observation = preprocess_observation(gym_observation)
+            if return_observations:
+                all_observations.append(deepcopy(observation))
 
-        # Convert to CPU / numpy.
-        action = action.to("cpu").numpy()
-        assert action.ndim == 2, "Action dimensions should be (batch, action_dim)"
+            observation = {key: observation[key].to(device, non_blocking=True) for key in observation}
+
+            with torch.inference_mode():
+                action = policy.select_action(observation)
+
+            # Convert to CPU / numpy.
+            action = action.to("cpu").numpy()
+            assert action.ndim == 2, "Action dimensions should be (batch, action_dim)"
+
+        policy_latency = time.perf_counter() - start_policy_time
+
+        if do_simulate_latency:
+            # Note: We use this for the rendering frame rate, but also the clock frequency discussed below.
+            fps = env.unwrapped.metadata["render_fps"]
+            # Make some assumptions about the setup we are simulating:
+            # 1. Suppose that observations and actions happen on the rising edge of the same clock. Therefore,
+            #    any action that is chosen based on an observation can't be executed till the next rising
+            #    edge. This means we have at least one clock cycle of delay (but it could be more if
+            #    inference takes longer than a clock cycle).
+            # 2. If an action is not available on the rising edge of the clock (maybe the policy is still
+            #    processing), we adopt the strategy of repeating the most recently executed action.
+            # 3. Further to point 2, if the policy is still processing a previous observation on the rising
+            #    edge of the clock (ie when a new observation comes in), it cannot handled the current/new
+            #    observation. In other words, we can only one instance of the policy (this is in light of
+            #    policies in LeRobot generally being stateful within a rollout).
+            # To be clear, we aren't actually simulating these phenomena explicitly (none of this code runs
+            # asynchronously). We are fudging the simulation by measuring inference time and delaying the
+            # application of actions by some number of environment steps.
+            # Note that this set of assumptions is by no means general. In real world settings we may have
+            # a separate clock for action and observation and they may have different frequencies and phases.
+            if not first_step_done_for_latency_logic:
+                # For the fist step, we pretend the starting state was frozen in time and the policy had
+                # unlimited time to decide on a first move.
+                action_queue.append((action, -1))  # -1 indicating we already have the action ready to go
+                first_step_done_for_latency_logic = True
+                continue
+            elif not is_dropped_cycle:
+                # Figure out how many cycles the action should be delayed by: floor(policy_latency / period).
+                # For example, if n_delay_cycles == 3, it means that it will supposedly take between 2 and 3
+                # clock cycles to predict the action based on the current observation. To account for this,
+                # we'll end up using it in a future loop iteration (3 iterations into the future to be
+                # precise).
+                n_delay_cycles = int(math.ceil(policy_latency * fps))
+                if n_delay_cycles == len(action_queue):
+                    # In this case, we just append onto the queue. For example, consider that we currently
+                    # have a queue:
+                    # [
+                    #   action to be executed now,
+                    #   action to be executed in 1 clock cycle,
+                    #   action to be executed in 2 clock cycles,
+                    # ]
+                    # For brevity, we will write:
+                    # action to be executed in... [0, 1, 2] ... clock cycles.
+                    # And consider n_delay_cycles == 3. After appending onto the queue we'll have:
+                    # action to be executed in... [0, 1, 2, 3] ... clock cycles.
+                    action_queue.append((action, policy_latency))
+                elif n_delay_cycles > len(action_queue):
+                    # This means that the latency may have been unusually high this time (or we are near
+                    # the start of the rollout). We can't add this action to the queue without forming a gap.
+                    # To fill the gap, we'll have to make do with repeating the last queued action.
+                    # For example, consider that we currently have a queue:
+                    # action to be executed in ... [0] ... clock cycles
+                    # And consider that we have n_delay_cycles == 3. We would then copy the first action twice
+                    # and append the currently predicted action onto the queue to get:
+                    # action to be executed in ... [0, 1, 2, 3] ... clock cycles
+                    #                           ^  ^  ^
+                    #               copies of 0 ┴──┘  └─ new action
+                    while len(action_queue) < n_delay_cycles:
+                        action_queue.append((action_queue[-1][0].copy(), action_queue[-1][1]))
+                    action_queue.append((action, policy_latency))
+                elif n_delay_cycles < len(action_queue):
+                    # This means something has gone wrong with this logic! Recall assumption #2. The policy
+                    # can't concurrently process observations from different steps.
+                    raise AssertionError("Something went wrong with the latency accounting logic.")
+
+            # Get the next action in the queue.
+            action, policy_latency_ = action_queue.popleft()
+            # Dev assertion. It should be that the policy was done producing this action in "the past".
+            assert policy_latency_ <= 0
+            # Shift all latencies by one clock cycle.
+            for i, item in enumerate(action_queue):
+                action_queue[i] = (item[0], item[-1] - 1 / fps)
 
         # Apply the next action.
-        observation, reward, terminated, truncated, info = env.step(action)
+        gym_observation, reward, terminated, truncated, info = env.step(action)
         if render_callback is not None:
-            render_callback(env)
+            render_callback(env, is_dropped_cycle)
 
         # VectorEnv stores is_success in `info["final_info"][env_index]["is_success"]`. "final_info" isn't
         # available of none of the envs finished.
@@ -177,16 +279,18 @@ def rollout(
         all_dones.append(torch.from_numpy(done))
         all_successes.append(torch.tensor(successes))
 
-        step += 1
         running_success_rate = (
             einops.reduce(torch.stack(all_successes, dim=1), "b n -> b", "any").numpy().mean()
         )
-        progbar.set_postfix({"running_success_rate": f"{running_success_rate.item() * 100:.1f}%"})
+        progbar_postfix = {"running_success_rate": f"{running_success_rate.item() * 100:.1f}%"}
+        if do_simulate_latency:
+            progbar_postfix.update({"n_dropped_cycles": n_dropped_cycles})
+        progbar.set_postfix(progbar_postfix)
         progbar.update()
 
     # Track the final observation.
     if return_observations:
-        observation = preprocess_observation(observation)
+        observation = preprocess_observation(gym_observation)
         all_observations.append(deepcopy(observation))
 
     # Stack the sequence along the first dimension so that we have (batch, sequence, *) tensors.
@@ -205,6 +309,15 @@ def rollout(
     return ret
 
 
+def _cv2_putText_by_top_left(text_top_left: tuple[int, int], **kwargs):  # noqa: N802
+    """A wrapper around cv2.putText that lets one place it by the top-left coord."""
+    text_size, _ = cv2.getTextSize(
+        kwargs["text"], kwargs["fontFace"], kwargs["fontScale"], kwargs["thickness"]
+    )
+    text_bottom_left = (text_top_left[0], min(text_top_left[1] + text_size[1], kwargs["img"].shape[0]))
+    cv2.putText(org=text_bottom_left, **kwargs)
+
+
 def eval_policy(
     env: gym.vector.VectorEnv,
     policy: torch.nn.Module,
@@ -213,6 +326,7 @@ def eval_policy(
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
+    do_simulate_latency: bool = False,
     enable_progbar: bool = False,
     enable_inner_progbar: bool = False,
 ) -> dict:
@@ -227,6 +341,8 @@ def eval_policy(
             the "episodes" key of the returned dictionary.
         start_seed: The first seed to use for the first individual rollout. For all subsequent rollouts the
             seed is incremented by 1. If not provided, the environments are not manually seeded.
+        do_simulate_latency: Whether to simulate latency between observation and action execution. See inline
+            documentation in `rollout` for more details.
         enable_progbar: Enable progress bar over batches.
         enable_inner_progbar: Enable progress bar over steps in each batch.
     Returns:
@@ -252,16 +368,35 @@ def eval_policy(
     n_episodes_rendered = 0  # for saving the correct number of videos
 
     # Callback for visualization.
-    def render_frame(env: gym.vector.VectorEnv):
+    def render_frame(env: gym.vector.VectorEnv, is_dropped_cycle: bool = False):
         # noqa: B023
         if n_episodes_rendered >= max_episodes_rendered:
             return
         n_to_render_now = min(max_episodes_rendered - n_episodes_rendered, env.num_envs)
         if isinstance(env, gym.vector.SyncVectorEnv):
-            ep_frames.append(np.stack([env.envs[i].render() for i in range(n_to_render_now)]))  # noqa: B023
+            img_batch = np.stack([env.envs[i].render() for i in range(n_to_render_now)])  # noqa: B023
         elif isinstance(env, gym.vector.AsyncVectorEnv):
             # Here we must render all frames and discard any we don't need.
-            ep_frames.append(np.stack(env.call("render")[:n_to_render_now]))
+            img_batch = np.stack(env.call("render")[:n_to_render_now])
+        if is_dropped_cycle:
+            # put a red border around the frame and some text to make it obvious that an action was dropped
+            # (see latency related documentation in `rollout`)
+            border_size = max(1, min(img_batch.shape[1:3]) // 40)
+            img_batch[:, :border_size] = [255, 0, 0]
+            img_batch[:, :, :border_size] = [255, 0, 0]
+            img_batch[:, -border_size:] = [255, 0, 0]
+            img_batch[:, :, -border_size:] = [255, 0, 0]
+            for img in img_batch:
+                _cv2_putText_by_top_left(
+                    text_top_left=(int(1.5 * border_size), int(1.5 * border_size)),
+                    img=img,
+                    text="Dropped cycle!",
+                    fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                    fontScale=0.8,
+                    thickness=1,
+                    color=(255, 0, 0),
+                )
+        ep_frames.append(img_batch)
 
     if max_episodes_rendered > 0:
         video_paths: list[str] = []
@@ -288,6 +423,7 @@ def eval_policy(
             seeds=list(seeds) if seeds else None,
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
+            do_simulate_latency=do_simulate_latency,
             enable_progbar=enable_inner_progbar,
         )
 
@@ -564,6 +700,7 @@ def main(
             max_episodes_rendered=10,
             videos_dir=Path(out_dir) / "videos",
             start_seed=hydra_cfg.seed,
+            do_simulate_latency=hydra_cfg.do_simulate_latency,
             enable_progbar=True,
             enable_inner_progbar=True,
         )
