@@ -1,0 +1,83 @@
+# @package _global_
+
+seed: 100000
+dataset_repo_id: lerobot/pusht
+
+training:
+  offline_steps: 200000
+  online_steps: 0
+  eval_freq: 5000
+  save_freq: 5000
+  log_freq: 250
+  save_model: true
+
+  batch_size: 64
+  grad_clip_norm: 1.0
+  lr: 1.0e-4
+  lr_scheduler: cosine
+  lr_warmup_steps: 2000
+  adamw_weight_decay: 0.1
+  online_steps_between_rollouts: 1
+
+  delta_timestamps:
+    observation.image: "[i / ${fps} for i in range(1 - ${policy.n_obs_steps}, 1)]"
+    observation.state: "[i / ${fps} for i in range(1 - ${policy.n_obs_steps}, 1)]"
+    action: "[i / ${fps} for i in range(1 - ${policy.n_obs_steps}, ${policy.horizon})]"
+
+eval:
+  n_episodes: 50
+  batch_size: 50
+
+policy:
+  name: octo
+
+  # Input / output structure.
+  n_obs_steps: 2
+  horizon: 16
+  n_action_steps: 8
+
+  input_shapes:
+    observation.image: [3, 96, 96]
+    observation.state: ["${env.state_dim}"]
+  output_shapes:
+    action: ["${env.action_dim}"]
+
+  # Normalization / Unnormalization
+  input_normalization_modes:
+    observation.image: mean_std
+    observation.state: min_max
+  output_normalization_modes:
+    action: min_max
+
+  # Architecture / modeling.
+  # Vision backbone.
+  vision_backbone: resnet18
+  crop_shape: [84, 84]
+  crop_is_random: True
+  pretrained_backbone_weights: null
+  use_group_norm: True
+  # OctoTransformer.
+  embed_dim: 384
+  n_readouts_per_step: 1
+  n_layers: 12
+  n_heads: 6
+  dim_feedforward: 1536
+  p_dropout: 0.
+  time_dim: 32
+  n_diffusion_head_layers: 3
+  diffusion_head_dim: 256
+  # Noise scheduler.
+  noise_scheduler_type: DDPM
+  num_train_timesteps: 20
+  beta_schedule: squaredcos_cap_v2
+  beta_start: 0.0001
+  beta_end: 0.02
+  prediction_type: epsilon # epsilon / sample
+  clip_sample: True
+  clip_sample_range: 1.0
+
+  # Inference
+  num_inference_steps: 20
+
+  # Loss computation
+  do_mask_loss_for_padding: false

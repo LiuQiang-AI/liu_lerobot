@@ -86,6 +86,21 @@ def make_optimizer_and_scheduler(cfg, policy):
     elif policy.name == "tdmpc":
         optimizer = torch.optim.Adam(policy.parameters(), cfg.training.lr)
         lr_scheduler = None
+    elif cfg.policy.name == "octo":
+        optimizer = torch.optim.AdamW(
+            policy.parameters(),
+            cfg.training.lr,
+            weight_decay=cfg.training.adamw_weight_decay,
+        )
+        # todo: this doesn't have the inverse square root scheduler octo originally uses, port it.
+        from diffusers.optimization import get_scheduler
+
+        lr_scheduler = get_scheduler(
+            cfg.training.lr_scheduler,
+            optimizer=optimizer,
+            num_warmup_steps=cfg.training.lr_warmup_steps,
+            num_training_steps=cfg.training.offline_steps,
+        )
     else:
         raise NotImplementedError()
 

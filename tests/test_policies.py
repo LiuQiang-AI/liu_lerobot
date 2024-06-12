@@ -48,6 +48,7 @@ def test_get_policy_and_config_classes(policy_name: str):
     [
         ("xarm", "tdmpc", ["policy.use_mpc=true", "dataset_repo_id=lerobot/xarm_lift_medium"]),
         ("pusht", "diffusion", []),
+        ("pusht", "octo", []),
         ("aloha", "act", ["env.task=AlohaInsertion-v0", "dataset_repo_id=lerobot/aloha_sim_insertion_human"]),
         (
             "aloha",
@@ -298,6 +299,11 @@ def test_normalize(insert_temporal_dim):
         ("aloha", "act", ["policy.n_action_steps=10"]),
         ("dora_aloha_real", "act_real", ["policy.n_action_steps=10"]),
         ("dora_aloha_real", "act_real_no_state", ["policy.n_action_steps=10"]),
+        (
+            "pusht",
+            "octo",
+            ["policy.n_action_steps=8", "policy.num_inference_steps=10"],
+        ),
     ],
 )
 # As artifacts have been generated on an x86_64 kernel, this test won't
